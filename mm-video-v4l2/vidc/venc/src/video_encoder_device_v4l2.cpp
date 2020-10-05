@@ -1671,6 +1671,13 @@ void venc_dev::venc_close()
                 pthread_join(m_tid,NULL);
         }
 
+        if (venc_handle->msg_thread_created) {
+            venc_handle->msg_thread_created = false;
+            venc_handle->msg_thread_stop = true;
+            post_message(venc_handle, omx_video::OMX_COMPONENT_CLOSE_MSG);
+            DEBUG_PRINT_HIGH("omx_video: Waiting on Msg Thread exit");
+            pthread_join(venc_handle->msg_thread_id, NULL);
+        }
         DEBUG_PRINT_HIGH("venc_close X");
         unsubscribe_to_events(m_nDriver_fd);
         close(m_poll_efd);
@@ -4282,17 +4289,19 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
 
                     fd = handle->fd;
                     plane[0].data_offset = 0;
-#ifdef _HW_RGBA
-                    plane[0].length = (m_sVenc_cfg.inputformat == V4L2_PIX_FMT_RGB32) ?
-                          VENUS_BUFFER_SIZE(COLOR_FMT_RGBA8888, handle->width, handle->height) : handle->size;
-#else
                     plane[0].length = handle->size;
-#endif
                     plane[0].bytesused = handle->size;
                     DEBUG_PRINT_LOW("venc_empty_buf: Opaque camera buf: fd = %d "
                                 ": filled %d of %d format 0x%lx", fd, plane[0].bytesused, plane[0].length, m_sVenc_cfg.inputformat);
                 }
             } else {
+                // color_format == 1 ==> RGBA to YUV Color-converted buffer
+                // Buffers color-converted via C2D have 601-Limited color
+                if (!streaming[OUTPUT_PORT]) {
+                    DEBUG_PRINT_HIGH("Setting colorspace 601-L for Color-converted buffer");
+                    venc_set_colorspace(MSM_VIDC_BT601_6_625, 0 /*range-limited*/,
+                            MSM_VIDC_TRANSFER_601_6_525, MSM_VIDC_MATRIX_601_6_525);
+                }
                 plane[0].m.userptr = (unsigned long) bufhdr->pBuffer;
                 plane[0].data_offset = bufhdr->nOffset;
                 plane[0].length = bufhdr->nAllocLen;
@@ -4375,7 +4384,7 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
     buf.timestamp.tv_sec = bufhdr->nTimeStamp / 1000000;
     buf.timestamp.tv_usec = (bufhdr->nTimeStamp % 1000000);
 
-    if (plane[0].bytesused && !handle_input_extradata(buf)) {
+    if (!handle_input_extradata(buf)) {
         DEBUG_PRINT_ERROR("%s Failed to handle input extradata", __func__);
         return false;
     }
@@ -6139,9 +6148,6 @@ bool venc_dev::venc_set_color_format(OMX_COLOR_FORMATTYPE color_format)
             color_space = V4L2_COLORSPACE_470_SYSTEM_BG;
             break;
         case QOMX_COLOR_Format32bitRGBA8888:
-#ifdef _HW_RGBA
-        case QOMX_COLOR_FormatAndroidOpaque:
-#endif
             m_sVenc_cfg.inputformat = V4L2_PIX_FMT_RGB32;
             break;
         case QOMX_COLOR_Format32bitRGBA8888Compressed:

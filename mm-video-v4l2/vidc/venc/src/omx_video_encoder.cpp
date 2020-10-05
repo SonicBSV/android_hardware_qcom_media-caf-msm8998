@@ -41,6 +41,7 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define strlcpy g_strlcpy
 #endif
 
+extern int m_pipe;
 static int bframes;
 static int entropy;
 static int perfmode;
@@ -598,27 +599,55 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING role)
     m_sExtraData = 0;
 
     if (eRet == OMX_ErrorNone) {
-        msg_thread_created = true;
-        r = pthread_create(&msg_thread_id,0, message_thread_enc, this);
-        if (r < 0) {
-            DEBUG_PRINT_ERROR("ERROR: message_thread_enc thread creation failed");
+        if (pipe(fds)) {
+            DEBUG_PRINT_ERROR("ERROR: pipe creation failed");
             eRet = OMX_ErrorInsufficientResources;
-            msg_thread_created = false;
             goto init_error;
         } else {
-            async_thread_created = true;
-            r = pthread_create(&async_thread_id,0, venc_dev::async_venc_message_thread, this);
-            if (r < 0) {
-                DEBUG_PRINT_ERROR("ERROR: venc_dev::async_venc_message_thread thread creation failed");
-                eRet = OMX_ErrorInsufficientResources;
-                async_thread_created = false;
-                msg_thread_stop = true;
-                pthread_join(msg_thread_id,NULL);
-                msg_thread_created = false;
-                goto init_error;
-            } else
-                dev_set_message_thread_id(async_thread_id);
+            if (fds[0] == 0 || fds[1] == 0) {
+                if (pipe(fds)) {
+                    DEBUG_PRINT_ERROR("ERROR: pipe creation failed");
+                    eRet = OMX_ErrorInsufficientResources;
+                    goto init_error;
+                }
+            }
+            if (eRet == OMX_ErrorNone) {
+                m_pipe_in = fds[0];
+                m_pipe_out = fds[1];
+
+                msg_thread_created = true;
+                r = pthread_create(&msg_thread_id,0, message_thread_enc, this);
+                if (r < 0) {
+                    DEBUG_PRINT_ERROR("ERROR: message_thread_enc thread creation failed");
+                    eRet = OMX_ErrorInsufficientResources;
+                    msg_thread_created = false;
+                    goto init_error;
+                } else {
+                    async_thread_created = true;
+                    r = pthread_create(&async_thread_id,0, venc_dev::async_venc_message_thread, this);
+                    if (r < 0) {
+                        DEBUG_PRINT_ERROR("ERROR: venc_dev::async_venc_message_thread thread creation failed");
+                        eRet = OMX_ErrorInsufficientResources;
+                        async_thread_created = false;
+
+                        msg_thread_stop = true;
+                        pthread_join(msg_thread_id,NULL);
+                        msg_thread_created = false;
+
+                        goto init_error;
+                    } else
+                        dev_set_message_thread_id(async_thread_id);
+                }
+            }
         }
+    }
+
+    if (perfmode) {
+        QOMX_EXTNINDEX_VIDEO_PERFMODE pParam;
+        pParam.nPerfMode = perfmode;
+        DEBUG_PRINT_LOW("Perfmode = 0x%x", pParam.nPerfMode);
+        if (!handle->venc_set_config(&pParam, (OMX_INDEXTYPE)OMX_QcomIndexConfigVideoVencPerfMode))
+            DEBUG_PRINT_ERROR("Failed setting PerfMode to %d", pParam.nPerfMode);
     }
 
     if (lowlatency)
@@ -1180,6 +1209,10 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
 
                 if (!secure_session) {
                     DEBUG_PRINT_HIGH("Enable/Disable allocate-native-handle allowed only in secure session");
+                    eRet = OMX_ErrorUnsupportedSetting;
+                    break;
+                } else if (allocateNativeHandleParams->nPortIndex != PORT_INDEX_OUT) {
+                    DEBUG_PRINT_HIGH("Enable/Disable allocate-native-handle allowed only on Output port!");
                     eRet = OMX_ErrorUnsupportedSetting;
                     break;
                 } else if (m_out_mem_ptr) {
@@ -2296,9 +2329,14 @@ OMX_ERRORTYPE  omx_venc::set_config(OMX_IN OMX_HANDLETYPE      hComp,
                VALIDATE_OMX_PARAM_DATA(configData, DescribeColorAspectsParams);
                DescribeColorAspectsParams *params = (DescribeColorAspectsParams *)configData;
                print_debug_color_aspects(&(params->sAspects), "set_config");
-               if (!handle->venc_set_config(configData, (OMX_INDEXTYPE)OMX_QTIIndexConfigDescribeColorAspects)) {
-                   DEBUG_PRINT_ERROR("Failed to set OMX_QTIIndexConfigDescribeColorAspects");
-                   return OMX_ErrorUnsupportedSetting;
+               if ((m_state != OMX_StateExecuting) && (!BITMASK_PRESENT(&m_flags,OMX_COMPONENT_EXECUTE_PENDING))) {
+                   if (!handle->venc_set_config(configData, (OMX_INDEXTYPE)OMX_QTIIndexConfigDescribeColorAspects)) {
+                       DEBUG_PRINT_ERROR("Failed to set OMX_QTIIndexConfigDescribeColorAspects");
+                       return OMX_ErrorUnsupportedSetting;
+                   }
+               }
+               else {
+                   DEBUG_PRINT_LOW("Ignoring colorspace setting when flag set to OMX_COMPONENT_EXECUTE_PENDING or state is in execute");
                }
                memcpy(&m_sConfigColorAspects, configData, sizeof(m_sConfigColorAspects));
                break;
@@ -2333,6 +2371,7 @@ OMX_ERRORTYPE  omx_venc::set_config(OMX_IN OMX_HANDLETYPE      hComp,
                     DEBUG_PRINT_ERROR("Failed to set perf level");
                     return OMX_ErrorUnsupportedSetting;
                 }
+                break;
             }
         case OMX_IndexConfigAndroidVendorExtension:
             {
@@ -2783,11 +2822,7 @@ int omx_venc::async_message_process (void *context, void* message)
                         native_handle_t *nh = (native_handle_t *)(omxhdr->pBuffer);
                         nh->data[1] = m_sVenc_msg->buf.offset;
                         nh->data[2] = m_sVenc_msg->buf.len;
-#ifdef _HW_RGBA
-                        omxhdr->nFilledLen = sizeof(int) * 3 + sizeof(int) * (nh->numFds+nh->numInts);
-#else
                         omxhdr->nFilledLen = m_sVenc_msg->buf.len;
-#endif
                         omxhdr->nTimeStamp = m_sVenc_msg->buf.timestamp;
                         omxhdr->nFlags = m_sVenc_msg->buf.flags;
                     } else {
